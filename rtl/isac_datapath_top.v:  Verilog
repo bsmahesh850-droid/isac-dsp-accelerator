@@ -1,95 +1,366 @@
-// =====================================================================
-// Module: isac_datapath_top
-// Description: Complete 6G ISAC DSP Datapath combining:
-//              Dual AXI-Stream FIR Filters (X & Y Noise Suppression) 
-//              -> AXI-Stream Pipelined CORDIC Core (Polar Conversion)
-// =====================================================================
-
 `timescale 1ns / 1ps
 
+// =====================================================================
+// Module 1: cordic_stage
+// =====================================================================
+module cordic_stage #(
+    parameter WIDTH = 16,
+    parameter STAGE_IDX = 0
+) (
+    input  wire                   clk,
+    input  wire                   rst_n,
+    input  wire                   in_valid,
+    input  signed [WIDTH-1:0]     x_in,
+    input  signed [WIDTH-1:0]     y_in,
+    input  signed [WIDTH-1:0]     z_in,
+    input  signed [WIDTH-1:0]     atan_const,
+    output reg                    out_valid,
+    output reg signed [WIDTH-1:0] x_out,
+    output reg signed [WIDTH-1:0] y_out,
+    output reg signed [WIDTH-1:0] z_out
+);
+
+    wire direction = y_in[WIDTH-1]; 
+    wire signed [WIDTH-1:0] x_shifted = x_in >>> STAGE_IDX;
+    wire signed [WIDTH-1:0] y_shifted = y_in >>> STAGE_IDX;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            out_valid <= 1'b0;
+            x_out     <= {WIDTH{1'b0}};
+            y_out     <= {WIDTH{1'b0}};
+            z_out     <= {WIDTH{1'b0}};
+        end else begin
+            out_valid <= in_valid;
+            if (direction) begin
+                x_out <= x_in + y_shifted;
+                y_out <= y_in - x_shifted;
+                z_out <= z_in - atan_const;
+            end else begin
+                x_out <= x_in - y_shifted;
+                y_out <= y_in + x_shifted;
+                z_out <= z_in + atan_const;
+            end
+        end
+    end
+endmodule
+
+
+// =====================================================================
+// Module 2: cordic_pipelined
+// =====================================================================
+module cordic_pipelined #(
+    parameter WIDTH = 16,
+    parameter STAGES = 16
+) (
+    input  wire                   clk,
+    input  wire                   rst_n,
+    input  wire                   s_axis_valid,
+    input  signed [WIDTH-1:0]     x_start,
+    input  signed [WIDTH-1:0]     y_start,
+    output wire                   m_axis_valid,
+    output wire signed [WIDTH-1:0] magnitude,
+    output wire signed [WIDTH-1:0] phase
+);
+
+    wire signed [WIDTH-1:0] x_wire [0:STAGES];
+    wire signed [WIDTH-1:0] y_wire [0:STAGES];
+    wire signed [WIDTH-1:0] z_wire [0:STAGES];
+    wire                    valid_wire [0:STAGES];
+
+    function signed [WIDTH-1:0] get_atan_const;
+        input integer idx;
+        begin
+            case (idx)
+                0:  get_atan_const = 16'sd12868;
+                1:  get_atan_const = 16'sd7593;
+                2:  get_atan_const = 16'sd4013;
+                3:  get_atan_const = 16'sd2036;
+                4:  get_atan_const = 16'sd1022;
+                5:  get_atan_const = 16'sd511;
+                6:  get_atan_const = 16'sd256;
+                7:  get_atan_const = 16'sd128;
+                8:  get_atan_const = 16'sd64;
+                9:  get_atan_const = 16'sd32;
+                10: get_atan_const = 16'sd16;
+                11: get_atan_const = 16'sd8;
+                12: get_atan_const = 16'sd4;
+                13: get_atan_const = 16'sd2;
+                14: get_atan_const = 16'sd1;
+                15: get_atan_const = 16'sd1;
+                default: get_atan_const = 16'sd0;
+            endcase
+        end
+    endfunction
+
+    assign x_wire[0]     = x_start;
+    assign y_wire[0]     = y_start;
+    assign z_wire[0]     = {WIDTH{1'b0}};
+    assign valid_wire[0] = s_axis_valid;
+
+    genvar i;
+    generate
+        for (i = 0; i < STAGES; i = i + 1) begin : gen_cordic_stages
+            cordic_stage #(
+                .WIDTH(WIDTH),
+                .STAGE_IDX(i)
+            ) u_stage (
+                .clk(clk),
+                .rst_n(rst_n),
+                .in_valid(valid_wire[i]),
+                .x_in(x_wire[i]),
+                .y_in(y_wire[i]),
+                .z_in(z_wire[i]),
+                .atan_const(get_atan_const(i)),
+                .out_valid(valid_wire[i+1]),
+                .x_out(x_wire[i+1]),
+                .y_out(y_wire[i+1]),
+                .z_out(z_wire[i+1])
+            );
+        end
+    endgenerate
+
+    assign m_axis_valid = valid_wire[STAGES];
+    assign magnitude    = x_wire[STAGES];
+    assign phase        = z_wire[STAGES];
+endmodule
+
+
+// =====================================================================
+// Module 3: cordic_axis_wrapper
+// =====================================================================
+module cordic_axis_wrapper #(
+    parameter WIDTH = 16,
+    parameter STAGES = 16
+) (
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [31:0] s_axis_tdata,
+    input  wire        s_axis_valid,
+    output wire        s_axis_tready,
+    output wire [31:0] m_axis_tdata,
+    output wire        m_axis_valid,
+    input  wire        m_axis_tready
+);
+
+    wire signed [WIDTH-1:0] x_start = s_axis_tdata[31:16];
+    wire signed [WIDTH-1:0] y_start = s_axis_tdata[15:0];
+    
+    wire signed [WIDTH-1:0] magnitude_wire;
+    wire signed [WIDTH-1:0] phase_wire;
+    wire                    core_valid;
+
+    assign s_axis_tready = m_axis_tready;
+
+    cordic_pipelined #(
+        .WIDTH(WIDTH),
+        .STAGES(STAGES)
+    ) u_cordic_core (
+        .clk(clk),
+        .rst_n(rst_n),
+        .s_axis_valid(s_axis_valid & s_axis_tready),
+        .x_start(x_start),
+        .y_start(y_start),
+        .m_axis_valid(core_valid),
+        .magnitude(magnitude_wire),
+        .phase(phase_wire)
+    );
+
+    assign m_axis_tdata  = {magnitude_wire, phase_wire};
+    assign m_axis_valid  = core_valid;
+endmodule
+
+
+// =====================================================================
+// Module 4: fir_filter_axis
+// =====================================================================
+module fir_filter_axis #(
+    parameter WIDTH = 16
+) (
+    input  wire                   clk,
+    input  wire                   rst_n,
+    input  wire [WIDTH-1:0]       s_axis_tdata,
+    input  wire                   s_axis_valid,
+    output wire                   s_axis_tready,
+    output reg  [WIDTH-1:0]       m_axis_tdata,
+    output reg                    m_axis_valid,
+    input  wire                   m_axis_tready
+);
+
+    reg signed [WIDTH-1:0] x0, x1, x2, x3;
+    reg signed [WIDTH+2:0] mult_sum; 
+    reg                    stage1_valid;
+    reg                    stage2_valid;
+
+    assign s_axis_tready = m_axis_tready;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            x0           <= {WIDTH{1'b0}};
+            x1           <= {WIDTH{1'b0}};
+            x2           <= {WIDTH{1'b0}};
+            x3           <= {WIDTH{1'b0}};
+            stage1_valid <= 1'b0;
+            stage2_valid <= 1'b0;
+            m_axis_valid <= 1'b0;
+            m_axis_tdata <= {WIDTH{1'b0}};
+            mult_sum     <= 0;
+        end else if (s_axis_tready) begin
+            if (s_axis_valid) begin
+                x0 <= $signed(s_axis_tdata);
+                x1 <= x0;
+                x2 <= x1;
+                x3 <= x2;
+                stage1_valid <= 1'b1;
+            end else begin
+                stage1_valid <= 1'b0;
+            end
+
+            if (stage1_valid) begin
+                mult_sum <= ($signed(x0) +$signed(x3)) * 1 + ($signed(x1) +$signed(x2)) * 3;
+                stage2_valid <= 1'b1;
+            end else begin
+                stage2_valid <= 1'b0;
+            end
+
+            if (stage2_valid) begin
+                m_axis_tdata <= mult_sum >>> 3;
+                m_axis_valid <= 1'b1;
+            end else begin
+                m_axis_valid <= 1'b0;
+            end
+        end
+    end
+endmodule
+
+
+// =====================================================================
+// Module 5: fft_butterfly_axis
+// =====================================================================
+module fft_butterfly_axis #(
+    parameter WIDTH = 16
+) (
+    input  wire                   clk,
+    input  wire                   rst_n,
+    input  wire [31:0]            s_axis_tdata_a,
+    input  wire [31:0]            s_axis_tdata_b,
+    input  wire                   s_axis_valid,
+    output wire                   s_axis_tready,
+    output reg  [31:0]            m_axis_tdata_x,
+    output reg  [31:0]            m_axis_tdata_y,
+    output reg                    m_axis_valid,
+    input  wire                   m_axis_tready
+);
+
+    wire signed [WIDTH-1:0] real_a = s_axis_tdata_a[31:16];
+    wire signed [WIDTH-1:0] imag_a = s_axis_tdata_a[15:0];
+    wire signed [WIDTH-1:0] real_b = s_axis_tdata_b[31:16];
+    wire signed [WIDTH-1:0] imag_b = s_axis_tdata_b[15:0];
+
+    reg signed [WIDTH:0]    sum_real, sub_real;
+    reg signed [WIDTH:0]    sum_imag, sub_imag;
+    reg                     stage_valid;
+
+    assign s_axis_tready = m_axis_tready;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sum_real       <= 0;
+            sub_real       <= 0;
+            sum_imag       <= 0;
+            sub_imag       <= 0;
+            stage_valid    <= 1'b0;
+            m_axis_tdata_x <= 32'h0;
+            m_axis_tdata_y <= 32'h0;
+            m_axis_valid   <= 1'b0;
+        end else if (s_axis_tready) begin
+            if (s_axis_valid) begin
+                sum_real <= $signed(real_a) +$signed(real_b);
+                sub_real <= $signed(real_a) -$signed(real_b);
+                sum_imag <= $signed(imag_a) +$signed(imag_b);
+                sub_imag <= $signed(imag_a) -$signed(imag_b);
+                stage_valid <= 1'b1;
+            end else begin
+                stage_valid <= 1'b0;
+            end
+
+            if (stage_valid) begin
+                m_axis_tdata_x <= {sum_real[WIDTH:1], sum_imag[WIDTH:1]};
+                m_axis_tdata_y <= {sub_real[WIDTH:1], sub_imag[WIDTH:1]};
+                m_axis_valid   <= 1'b1;
+            end else begin
+                m_axis_valid   <= 1'b0;
+            end
+        end
+    end
+endmodule
+
+
+// =====================================================================
+// Module 6: isac_datapath_top (Top Level - FIR -> FFT -> CORDIC)
+// =====================================================================
 module isac_datapath_top #(
     parameter WIDTH = 16,
     parameter STAGES = 16
 ) (
     input  wire        clk,
     input  wire        rst_n,
-    
-    // AXI-Stream Slave Interface (Raw 32-bit I/Q Input: X [31:16], Y [15:0])
     input  wire [31:0] s_axis_tdata,
     input  wire        s_axis_valid,
     output wire        s_axis_tready,
-    
-    // AXI-Stream Master Interface (Processed Output: Magnitude [31:16], Phase [15:0])
     output wire [31:0] m_axis_tdata,
     output wire        m_axis_valid,
     input  wire        m_axis_tready
 );
 
-    // Unpack raw input into X (In-phase) and Y (Quadrature) channels
     wire signed [WIDTH-1:0] x_raw = s_axis_tdata[31:16];
     wire signed [WIDTH-1:0] y_raw = s_axis_tdata[15:0];
 
-    // Internal wires for filtered X and Y streams
-    wire [WIDTH-1:0] x_filtered;
-    wire             x_filt_valid;
-    wire             x_filt_ready;
+    wire [WIDTH-1:0] x_filtered, y_filtered;
+    wire             x_filt_valid, y_filt_valid;
+    wire             x_filt_ready, y_filt_ready;
 
-    wire [WIDTH-1:0] y_filtered;
-    wire             y_filt_valid;
-    wire             y_filt_ready;
-
-    // Combined ready signal from both FIR filters
     assign s_axis_tready = x_filt_ready & y_filt_ready;
 
-    // -----------------------------------------------------------------
-    // 1. Instantiate FIR Filter for X (In-phase) Channel
-    // -----------------------------------------------------------------
-    fir_filter_axis #(
-        .WIDTH(WIDTH)
-    ) u_fir_x (
-        .clk(clk),
-        .rst_n(rst_n),
-        .s_axis_tdata(x_raw),
-        .s_axis_valid(s_axis_valid & s_axis_tready),
-        .s_axis_tready(x_filt_ready),
-        .m_axis_tdata(x_filtered),
-        .m_axis_valid(x_filt_valid),
-        .m_axis_tready(cordic_s_axis_ready)
+    // 1. Dual FIR Noise Filters
+    fir_filter_axis #(.WIDTH(WIDTH)) u_fir_x (
+        .clk(clk), .rst_n(rst_n),
+        .s_axis_tdata(x_raw), .s_axis_valid(s_axis_valid & s_axis_tready), .s_axis_tready(x_filt_ready),
+        .m_axis_tdata(x_filtered), .m_axis_valid(x_filt_valid), .m_axis_tready(fft_s_ready)
     );
 
-    // -----------------------------------------------------------------
-    // 2. Instantiate FIR Filter for Y (Quadrature) Channel
-    // -----------------------------------------------------------------
-    fir_filter_axis #(
-        .WIDTH(WIDTH)
-    ) u_fir_y (
-        .clk(clk),
-        .rst_n(rst_n),
-        .s_axis_tdata(y_raw),
-        .s_axis_valid(s_axis_valid & s_axis_tready),
-        .s_axis_tready(y_filt_ready),
-        .m_axis_tdata(y_filtered),
-        .m_axis_valid(y_filt_valid),
-        .m_axis_tready(cordic_s_axis_ready)
+    fir_filter_axis #(.WIDTH(WIDTH)) u_fir_y (
+        .clk(clk), .rst_n(rst_n),
+        .s_axis_tdata(y_raw), .s_axis_valid(s_axis_valid & s_axis_tready), .s_axis_tready(y_filt_ready),
+        .m_axis_tdata(y_filtered), .m_axis_valid(y_filt_valid), .m_axis_tready(fft_s_ready)
     );
 
-    // Synchronize valid signals from both parallel filter stages
     wire filters_valid = x_filt_valid & y_filt_valid;
-    wire [31:0] cordic_input_tdata = {x_filtered, y_filtered};
-    wire cordic_s_axis_ready;
+    wire [31:0] filtered_complex = {x_filtered, y_filtered};
+    wire        fft_s_ready;
+    wire [31:0] fft_out_x, fft_out_y;
+    wire        fft_m_valid;
+    wire        cordic_s_ready;
 
-    // -----------------------------------------------------------------
-    // 3. Instantiate AXI-Stream CORDIC Core (Cartesian to Polar)
-    // -----------------------------------------------------------------
-    cordic_axis_wrapper #(
-        .WIDTH(WIDTH),
-        .STAGES(STAGES)
-    ) u_cordic_wrapper (
-        .clk(clk),
-        .rst_n(rst_n),
-        .s_axis_tdata(cordic_input_tdata),
+    // 2. Radix-2 FFT Butterfly Processing Element
+    fft_butterfly_axis #(.WIDTH(WIDTH)) u_fft_butterfly (
+        .clk(clk), .rst_n(rst_n),
+        .s_axis_tdata_a(filtered_complex),
+        .s_axis_tdata_b(32'h00000000), // Zero baseline for single stream demo
         .s_axis_valid(filters_valid),
-        .s_axis_tready(cordic_s_axis_ready),
+        .s_axis_tready(fft_s_ready),
+        .m_axis_tdata_x(fft_out_x),
+        .m_axis_tdata_y(fft_out_y),
+        .m_axis_valid(fft_m_valid),
+        .m_axis_tready(cordic_s_ready)
+    );
+
+    // 3. AXI-Stream CORDIC Polar Converter (Processes FFT Bin X)
+    cordic_axis_wrapper #(.WIDTH(WIDTH), .STAGES(STAGES)) u_cordic_wrapper (
+        .clk(clk), .rst_n(rst_n),
+        .s_axis_tdata(fft_out_x),
+        .s_axis_valid(fft_m_valid),
+        .s_axis_tready(cordic_s_ready),
         .m_axis_tdata(m_axis_tdata),
         .m_axis_valid(m_axis_valid),
         .m_axis_tready(m_axis_tready)
