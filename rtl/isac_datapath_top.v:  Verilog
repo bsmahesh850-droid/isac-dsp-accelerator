@@ -1,0 +1,98 @@
+// =====================================================================
+// Module: isac_datapath_top
+// Description: Complete 6G ISAC DSP Datapath combining:
+//              Dual AXI-Stream FIR Filters (X & Y Noise Suppression) 
+//              -> AXI-Stream Pipelined CORDIC Core (Polar Conversion)
+// =====================================================================
+
+`timescale 1ns / 1ps
+
+module isac_datapath_top #(
+    parameter WIDTH = 16,
+    parameter STAGES = 16
+) (
+    input  wire        clk,
+    input  wire        rst_n,
+    
+    // AXI-Stream Slave Interface (Raw 32-bit I/Q Input: X [31:16], Y [15:0])
+    input  wire [31:0] s_axis_tdata,
+    input  wire        s_axis_valid,
+    output wire        s_axis_tready,
+    
+    // AXI-Stream Master Interface (Processed Output: Magnitude [31:16], Phase [15:0])
+    output wire [31:0] m_axis_tdata,
+    output wire        m_axis_valid,
+    input  wire        m_axis_tready
+);
+
+    // Unpack raw input into X (In-phase) and Y (Quadrature) channels
+    wire signed [WIDTH-1:0] x_raw = s_axis_tdata[31:16];
+    wire signed [WIDTH-1:0] y_raw = s_axis_tdata[15:0];
+
+    // Internal wires for filtered X and Y streams
+    wire [WIDTH-1:0] x_filtered;
+    wire             x_filt_valid;
+    wire             x_filt_ready;
+
+    wire [WIDTH-1:0] y_filtered;
+    wire             y_filt_valid;
+    wire             y_filt_ready;
+
+    // Combined ready signal from both FIR filters
+    assign s_axis_tready = x_filt_ready & y_filt_ready;
+
+    // -----------------------------------------------------------------
+    // 1. Instantiate FIR Filter for X (In-phase) Channel
+    // -----------------------------------------------------------------
+    fir_filter_axis #(
+        .WIDTH(WIDTH)
+    ) u_fir_x (
+        .clk(clk),
+        .rst_n(rst_n),
+        .s_axis_tdata(x_raw),
+        .s_axis_valid(s_axis_valid & s_axis_tready),
+        .s_axis_tready(x_filt_ready),
+        .m_axis_tdata(x_filtered),
+        .m_axis_valid(x_filt_valid),
+        .m_axis_tready(cordic_s_axis_ready)
+    );
+
+    // -----------------------------------------------------------------
+    // 2. Instantiate FIR Filter for Y (Quadrature) Channel
+    // -----------------------------------------------------------------
+    fir_filter_axis #(
+        .WIDTH(WIDTH)
+    ) u_fir_y (
+        .clk(clk),
+        .rst_n(rst_n),
+        .s_axis_tdata(y_raw),
+        .s_axis_valid(s_axis_valid & s_axis_tready),
+        .s_axis_tready(y_filt_ready),
+        .m_axis_tdata(y_filtered),
+        .m_axis_valid(y_filt_valid),
+        .m_axis_tready(cordic_s_axis_ready)
+    );
+
+    // Synchronize valid signals from both parallel filter stages
+    wire filters_valid = x_filt_valid & y_filt_valid;
+    wire [31:0] cordic_input_tdata = {x_filtered, y_filtered};
+    wire cordic_s_axis_ready;
+
+    // -----------------------------------------------------------------
+    // 3. Instantiate AXI-Stream CORDIC Core (Cartesian to Polar)
+    // -----------------------------------------------------------------
+    cordic_axis_wrapper #(
+        .WIDTH(WIDTH),
+        .STAGES(STAGES)
+    ) u_cordic_wrapper (
+        .clk(clk),
+        .rst_n(rst_n),
+        .s_axis_tdata(cordic_input_tdata),
+        .s_axis_valid(filters_valid),
+        .s_axis_tready(cordic_s_axis_ready),
+        .m_axis_tdata(m_axis_tdata),
+        .m_axis_valid(m_axis_valid),
+        .m_axis_tready(m_axis_tready)
+    );
+
+endmodule
